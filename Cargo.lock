@@ -994,6 +994,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "dotenvy",
  "sqlx",
  "tokio",
 ]

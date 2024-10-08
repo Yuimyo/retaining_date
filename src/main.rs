@@ -1,8 +1,8 @@
-use anyhow::{bail, Result};
-use chrono::{DateTime, TimeZone, Utc};
-use clap::{arg, Parser, Subcommand};
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Local, TimeZone, Utc};
+use clap::Parser;
 use sqlx::{Acquire, SqlitePool};
-use std::{env::args, path::PathBuf, time::SystemTime};
+use std::{path::PathBuf, time::SystemTime};
 
 #[derive(Parser)]
 enum Commands {
@@ -12,61 +12,63 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let pool = SqlitePool::connect("file:data.db").await.unwrap();
+    let database_file_name = dotenvy::var("DATABASE_PATH")?;
+    let pool = SqlitePool::connect(&format!("file:{}", database_file_name)).await?;
 
     match Commands::parse() {
-        Commands::Apply { path } => apply_dir_props(&pool, path.into()).await,
-        Commands::Save { path } => save_dir_props(&pool, path.into()).await,
+        Commands::Apply { path } => apply_dirs_props(&pool, path.into()).await,
+        Commands::Save { path } => save_dirs_props(&pool, path.into()).await,
     }
 }
 
-async fn apply_dir_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
+async fn apply_dirs_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
     if !dir.exists() {
         bail!("Doesn't exist dir: {:?}", dir);
     }
-    let dir_prop_row_id: i64 = get_dir_prop_row_id(pool, dir.clone()).await?;
+    let dir_prop_row_id: i64 = get_dir_prop_row_id(pool, dir.clone())
+        .await
+        .context(format!("Failed to get dir_prop_row_id: {:?}", dir))?;
 
     let mut tx = pool.begin().await?;
     let conn = tx.acquire().await?;
 
-    let cached_time: u64 = match sqlx::query_as::<_, (String,)>(
+    let latest_cached_time: DateTime<Local> = match sqlx::query_as::<_, (DateTime<Local>,)>(
         "
             SELECT cached_date FROM dir_actions_log
-            WHERE dir_id = $1 AND action_type = 0
+            WHERE dir_id = $1 AND action_type = $2
             ORDER BY cached_date DESC
             LIMIT 1
         ",
     )
     .bind(dir_prop_row_id)
+    .bind(LogActionType::CacheDates)
     .fetch_one(&mut *conn)
     .await
     {
+        Ok((cached_date,)) => cached_date,
         Err(sqlx::Error::RowNotFound) => {
             return Ok(());
         }
         Err(e) => return Err(e.into()),
-        Ok((cached_date,)) => cached_date.parse::<u64>()?,
     };
 
-    let files_props: Vec<_> = match sqlx::query_as::<_, (String, String, String)>(
-        r#"
-        SELECT name, created_date, modified_date FROM dir_file_props
-        WHERE dir_id = $1 AND cached_date = $2
-    "#,
+    let files_props: Vec<_> = match sqlx::query_as::<_, (String, DateTime<Local>, DateTime<Local>)>(
+        "
+            SELECT name, created_date, modified_date FROM dir_file_props
+            WHERE dir_id = $1 AND cached_date = $2
+        ",
     )
     .bind(dir_prop_row_id)
-    .bind(format!("{}", cached_time))
+    .bind(latest_cached_time)
     .fetch_all(&mut *conn)
     .await
     {
+        Ok(files_props) => files_props,
         Err(sqlx::Error::RowNotFound) => return Ok(()),
         Err(e) => return Err(e.into()),
-        Ok(files_props) => files_props,
     };
 
-    for (name, created_date, modified_date) in files_props {
-        let modified_date: u64 = modified_date.parse::<u64>()?;
-
+    for (name, _, file_previous_modified_date) in files_props {
         let file_path = dir.clone().join(name);
         if !file_path.exists() || !file_path.is_file() {
             continue;
@@ -76,7 +78,7 @@ async fn apply_dir_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
             .read(true)
             .write(true)
             .open(file_path)?;
-        file.set_modified(unix_to_system_time(modified_date))?;
+        file.set_modified(datetime_local_to_system_time(file_previous_modified_date))?;
     }
 
     tx.commit().await?;
@@ -84,12 +86,14 @@ async fn apply_dir_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn save_dir_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
+async fn save_dirs_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
     if !dir.exists() {
         bail!("Doesn't exist dir: {:?}", dir);
     }
-    let dir_prop_row_id: i64 = get_dir_prop_row_id(pool, dir.clone()).await?;
-    let cached_time: u64 = Utc::now().timestamp() as u64;
+    let dir_prop_row_id: i64 = get_dir_prop_row_id(pool, dir.clone())
+        .await
+        .context(format!("Failed to get dir_prop_row_id: {:?}", dir))?;
+    let cached_time: DateTime<Local> = Local::now();
 
     let mut tx = pool.begin().await?;
     let conn = tx.acquire().await?;
@@ -103,8 +107,8 @@ async fn save_dir_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
         ",
     )
     .bind(dir_prop_row_id)
-    .bind(0)
-    .bind(format!("{}", cached_time))
+    .bind(LogActionType::CacheDates)
+    .bind(cached_time)
     .execute(&mut *conn)
     .await?;
 
@@ -113,56 +117,61 @@ async fn save_dir_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let entry_file_name = entry.file_name();
-        let entry_file_name = entry_file_name.to_str().unwrap();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_str().ok_or(anyhow!(
+            "Unable to convert OsString to &str: {:?}",
+            file_name
+        ))?;
 
         if let Ok(metadata) = entry.metadata() {
-            let created_time = system_time_to_unix(metadata.created()?)?;
-            let modified_time = system_time_to_unix(metadata.modified()?)?;
+            let created_time: DateTime<Local> = system_time_to_datetime_local(metadata.created()?);
+            let modified_time: DateTime<Local> =
+                system_time_to_datetime_local(metadata.modified()?);
+
             match sqlx::query_as::<_, (u32,)>(
-                r#"
-                SELECT id FROM dir_file_props
-                WHERE dir_id = $1 AND name = $2
-                LIMIT 1
-            "#,
+                "
+                    SELECT id FROM dir_file_props
+                    WHERE dir_id = $1 AND name = $2
+                    LIMIT 1
+                ",
             )
             .bind(dir_prop_row_id)
-            .bind(entry_file_name)
+            .bind(file_name)
             .fetch_one(&mut *conn)
             .await
             {
+                Ok((file_prop_row_id,)) => {
+                    sqlx::query(
+                        "
+                            UPDATE dir_file_props 
+                            SET cached_date = $2, created_date = $3, modified_date = $4
+                            WHERE id = $1
+                        ",
+                    )
+                    .bind(file_prop_row_id)
+                    .bind(cached_time)
+                    .bind(created_time)
+                    .bind(modified_time)
+                    .execute(&mut *conn)
+                    .await?;
+                }
                 Err(sqlx::Error::RowNotFound) => {
                     sqlx::query(
-                        r#"
-                        INSERT INTO dir_file_props 
-                        (dir_id, name, cached_date, created_date, modified_date) 
-                        VALUES ($1, $2, $3, $4, $5)
-                    "#,
+                        "
+                            INSERT INTO dir_file_props 
+                            (dir_id, name, cached_date, created_date, modified_date) 
+                            VALUES ($1, $2, $3, $4, $5)
+                        ",
                     )
                     .bind(dir_prop_row_id)
-                    .bind(entry_file_name)
-                    .bind(format!("{}", cached_time))
-                    .bind(format!("{}", created_time))
-                    .bind(format!("{}", modified_time))
+                    .bind(file_name)
+                    .bind(cached_time)
+                    .bind(created_time)
+                    .bind(modified_time)
                     .execute(&mut *conn)
                     .await?;
                 }
                 Err(e) => return Err(e.into()),
-                Ok((file_prop_row_id,)) => {
-                    sqlx::query(
-                        r#"
-                        UPDATE dir_file_props 
-                        SET cached_date = $2, created_date = $3, modified_date = $4
-                        WHERE id = $1
-                    "#,
-                    )
-                    .bind(file_prop_row_id)
-                    .bind(format!("{}", cached_time))
-                    .bind(format!("{}", created_time))
-                    .bind(format!("{}", modified_time))
-                    .execute(&mut *conn)
-                    .await?;
-                }
             };
         }
     }
@@ -174,23 +183,27 @@ async fn save_dir_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
 
 async fn get_dir_prop_row_id(pool: &SqlitePool, dir: PathBuf) -> Result<i64> {
     let mut dir_path_str = dir.clone();
-    let dir_path_str = dir_path_str.as_mut_os_str().to_str().unwrap();
+    let dir_path_str = dir_path_str
+        .as_mut_os_str()
+        .to_str()
+        .ok_or(anyhow!("Unable to convert PathBuf to &str: {:?}", dir))?;
 
     let mut tx = pool.begin().await?;
     let conn = tx.acquire().await?;
 
     // poolのdir_propsテーブルから、dir_path_strに対応するprimary keyを取得する。存在しないなら新たに作成する。
     let dir_prop_row_id: i64 = match sqlx::query_as::<_, (i64,)>(
-        r#"
-        SELECT id FROM dir_props
-        WHERE path = $1
-        LIMIT 1
-    "#,
+        "
+            SELECT id FROM dir_props
+            WHERE path = $1
+            LIMIT 1
+        ",
     )
     .bind(dir_path_str)
     .fetch_one(&mut *conn)
     .await
     {
+        Ok((id,)) => id,
         Err(sqlx::Error::RowNotFound) => {
             let path_inserting_result = sqlx::query(
                 "
@@ -206,7 +219,6 @@ async fn get_dir_prop_row_id(pool: &SqlitePool, dir: PathBuf) -> Result<i64> {
             path_inserting_result.last_insert_rowid()
         }
         Err(e) => return Err(e.into()),
-        Ok((id,)) => id,
     };
 
     tx.commit().await?;
@@ -214,12 +226,51 @@ async fn get_dir_prop_row_id(pool: &SqlitePool, dir: PathBuf) -> Result<i64> {
     Ok(dir_prop_row_id)
 }
 
-fn system_time_to_unix(system_time: SystemTime) -> Result<u64> {
-    Ok(system_time.duration_since(std::time::UNIX_EPOCH)?.as_secs())
+#[derive(Debug, Clone, Copy)]
+enum LogActionType {
+    CacheDates,
 }
 
-fn unix_to_system_time(unix_time: u64) -> SystemTime {
-    std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_time)
+impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for LogActionType {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+    ) -> std::result::Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        let action_type: u8 = (*self).into();
+        buf.push(sqlx::sqlite::SqliteArgumentValue::Int(action_type as _));
+
+        Ok(sqlx::encode::IsNull::No)
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for LogActionType {
+    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+        u8::type_info()
+    }
+}
+
+impl From<u8> for LogActionType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => LogActionType::CacheDates,
+            _ => unreachable!(),
+        }
+    }
+}
+impl From<LogActionType> for u8 {
+    fn from(value: LogActionType) -> Self {
+        match value {
+            LogActionType::CacheDates => 0,
+        }
+    }
+}
+
+fn system_time_to_datetime_local(system_time: SystemTime) -> DateTime<Local> {
+    system_time.into()
+}
+
+fn datetime_local_to_system_time(datetime: DateTime<Local>) -> SystemTime {
+    datetime.into()
 }
 
 fn unix_to_date_time(unix_time: u64) -> Result<DateTime<Utc>> {
