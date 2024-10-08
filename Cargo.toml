@@ -1,0 +1,11 @@
+[package]
+name = "retaining_date"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+sqlx = {version = "0.8.2", features = ["chrono", "sqlite", "runtime-tokio"]}
+chrono = "0.4.38"
+anyhow = "1"
+clap = { version = "4.5.19", features = ["derive"] }
