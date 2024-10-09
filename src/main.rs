@@ -1,13 +1,20 @@
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Local, TimeZone, Utc};
+use async_recursion::async_recursion;
+use chrono::{DateTime, Local};
 use clap::Parser;
 use sqlx::{Acquire, SqlitePool};
 use std::{path::PathBuf, time::SystemTime};
 
 #[derive(Parser)]
 enum Commands {
-    Apply { path: String },
-    Save { path: String },
+    Apply {
+        path: String,
+    },
+    Save {
+        path: String,
+        #[arg(short = 'r', long = "recursive")]
+        recursive: bool,
+    },
 }
 
 #[tokio::main]
@@ -17,8 +24,27 @@ async fn main() -> Result<()> {
 
     match Commands::parse() {
         Commands::Apply { path } => apply_dirs_props(&pool, path.into()).await,
-        Commands::Save { path } => save_dirs_props(&pool, path.into()).await,
+        Commands::Save { path, recursive } => {
+            if recursive {
+                save_dirs_props_recursive(&pool, path.into()).await
+            } else {
+                save_dirs_props(&pool, path.into()).await
+            }
+        }
     }
+}
+
+#[async_recursion]
+async fn save_dirs_props_recursive(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
+    save_dirs_props(pool, dir.clone()).await?;
+    for entry in dir.read_dir()? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            save_dirs_props_recursive(pool, entry.path()).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn apply_dirs_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
@@ -94,6 +120,7 @@ async fn save_dirs_props(pool: &SqlitePool, dir: PathBuf) -> Result<()> {
         .await
         .context(format!("Failed to get dir_prop_row_id: {:?}", dir))?;
     let cached_time: DateTime<Local> = Local::now();
+    println!("save: {} | {:?}", dir_prop_row_id, dir);
 
     let mut tx = pool.begin().await?;
     let conn = tx.acquire().await?;
@@ -271,11 +298,4 @@ fn system_time_to_datetime_local(system_time: SystemTime) -> DateTime<Local> {
 
 fn datetime_local_to_system_time(datetime: DateTime<Local>) -> SystemTime {
     datetime.into()
-}
-
-fn unix_to_date_time(unix_time: u64) -> Result<DateTime<Utc>> {
-    match Utc.timestamp_opt(unix_time as i64, 0).single() {
-        Some(date_time) => Ok(date_time),
-        None => bail!("invalid timestamp"),
-    }
 }

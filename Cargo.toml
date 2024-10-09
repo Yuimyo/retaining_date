@@ -10,3 +10,4 @@ chrono = "0.4.38"
 anyhow = "1"
 clap = { version = "4.5.19", features = ["derive"] }
 dotenvy = "0.15.7"
+async-recursion = "1.1.1"
